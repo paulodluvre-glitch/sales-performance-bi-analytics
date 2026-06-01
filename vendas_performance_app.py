@@ -141,6 +141,33 @@ def validar_colunas_necessarias(df, nome_arquivo):
     )
 
 
+def converter_coluna_data(serie):
+    if pd.api.types.is_datetime64_any_dtype(serie):
+        return pd.to_datetime(serie, errors='coerce')
+
+    if pd.api.types.is_numeric_dtype(serie):
+        return pd.to_datetime(serie, errors='coerce', unit='D', origin='1899-12-30')
+
+    serie_texto = serie.astype(str).str.strip()
+    serie_texto = serie_texto.replace({'': pd.NA, 'nan': pd.NA, 'nat': pd.NA, 'none': pd.NA})
+
+    datas = pd.Series(pd.NaT, index=serie.index, dtype='datetime64[ns]')
+    mascara_iso = serie_texto.str.match(r'^\d{4}[-/]\d{1,2}[-/]\d{1,2}$', na=False)
+
+    if mascara_iso.any():
+        datas.loc[mascara_iso] = pd.to_datetime(serie_texto.loc[mascara_iso], errors='coerce')
+
+    mascara_restante = ~mascara_iso & serie_texto.notna()
+    if mascara_restante.any():
+        datas.loc[mascara_restante] = pd.to_datetime(
+            serie_texto.loc[mascara_restante],
+            errors='coerce',
+            dayfirst=True
+        )
+
+    return datas
+
+
 @st.cache_data
 def tratar_base_bruta(arquivos):
     lista_df = []
@@ -167,7 +194,7 @@ def tratar_base_bruta(arquivos):
         df['quantidade'] = pd.to_numeric(df['quantidade'], errors='coerce').fillna(0).astype(int)
 
     if 'data' in df.columns:
-        df['data'] = pd.to_datetime(df['data'], errors='coerce', dayfirst=True)
+        df['data'] = converter_coluna_data(df['data'])
         df = df.dropna(subset=['data'])
 
         if df.empty:
@@ -186,7 +213,11 @@ def tratar_base_bruta(arquivos):
         df['dia semana'] = df['data'].dt.dayofweek.map(dias_semana)
 
         cond_descendio = [(df['dia'] <= 10), (df['dia'] > 10) & (df['dia'] <= 20), (df['dia'] > 20)]
-        df['descêndio'] = np.select(cond_descendio, ['1º Descêndio', '2º Descêndio', '3º Descêndio'])
+        df['descêndio'] = np.select(
+            cond_descendio,
+            ['1º Descêndio', '2º Descêndio', '3º Descêndio'],
+            default='Sem descêndio'
+        )
 
     if 'data' in df.columns and 'nrovenda' in df.columns:
         df['id_venda'] = df['data'].dt.strftime('%Y-%m-%d') + '-' + df['nrovenda'].astype(str)
