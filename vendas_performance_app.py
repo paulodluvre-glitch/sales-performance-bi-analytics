@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
+import importlib.util
 import re
 import unicodedata
 
@@ -43,6 +44,8 @@ estilo_impressao = """
 </style>
 """
 st.markdown(estilo_impressao, unsafe_allow_html=True)
+
+MATPLOTLIB_DISPONIVEL = importlib.util.find_spec("matplotlib") is not None
 
 ALIAS_COLUNAS = {
     'nro_venda': 'nrovenda',
@@ -166,6 +169,22 @@ def converter_coluna_data(serie):
         )
 
     return datas
+
+
+def estilizar_mapa_calor(df_heat_display):
+    styler = df_heat_display.style.format({
+        'Faturamento Líquido': 'R$ {:,.2f}',
+        'Ticket Médio': 'R$ {:,.2f}',
+        'P.A.': '{:.2f}',
+        'Peças (Qtd)': '{:.0f}',
+        'Vendas (Qtd)': '{:.0f}'
+    })
+
+    if MATPLOTLIB_DISPONIVEL:
+        styler = styler.background_gradient(subset=['Faturamento Líquido'], cmap='Oranges')
+        styler = styler.background_gradient(subset=['Vendas (Qtd)'], cmap='Blues')
+
+    return styler
 
 
 @st.cache_data
@@ -452,16 +471,7 @@ with aba2:
             df_heat_display.columns = ['Dia da Semana', 'Peças (Qtd)', 'Vendas (Qtd)', 'Faturamento Líquido', 'P.A.', 'Ticket Médio']
             
             st.dataframe(
-                df_heat_display.style
-                .format({
-                    'Faturamento Líquido': 'R$ {:,.2f}',
-                    'Ticket Médio': 'R$ {:,.2f}',
-                    'P.A.': '{:.2f}',
-                    'Peças (Qtd)': '{:.0f}',
-                    'Vendas (Qtd)': '{:.0f}'
-                })
-                .background_gradient(subset=['Faturamento Líquido'], cmap='Oranges') 
-                .background_gradient(subset=['Vendas (Qtd)'], cmap='Blues'),         
+                estilizar_mapa_calor(df_heat_display),
                 hide_index=True, 
                 use_container_width=True
             )
