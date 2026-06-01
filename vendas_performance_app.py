@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from io import BytesIO
+import re
+import unicodedata
 
 st.set_page_config(page_title="Relatório de Performance de Vendas - Morana", layout="wide")
 
@@ -42,16 +44,116 @@ estilo_impressao = """
 """
 st.markdown(estilo_impressao, unsafe_allow_html=True)
 
+ALIAS_COLUNAS = {
+    'nro_venda': 'nrovenda',
+    'numero_venda': 'nrovenda',
+    'num_venda': 'nrovenda',
+    'nr_venda': 'nrovenda',
+    'n_venda': 'nrovenda',
+    'data_venda': 'data',
+    'data_da_venda': 'data',
+    'dt_venda': 'data',
+    'qtd': 'quantidade',
+    'qtde': 'quantidade',
+    'valor_base_de_calculo_comissao': 'valor_base_calculo_comissao',
+    'valor_base_calculo_da_comissao': 'valor_base_calculo_comissao',
+    'valor_base_comissao': 'valor_base_calculo_comissao',
+    'categoria_produto': 'categoria',
+    'categoria_do_produto': 'categoria'
+}
+
+
+def normalizar_nome_coluna(coluna):
+    texto = str(coluna).strip().lower()
+    texto = unicodedata.normalize('NFKD', texto).encode('ascii', 'ignore').decode('ascii')
+    texto = re.sub(r'[^a-z0-9]+', '_', texto)
+    texto = re.sub(r'_+', '_', texto).strip('_')
+    return ALIAS_COLUNAS.get(texto, texto)
+
+
+def ler_planilha_bruta(arquivo):
+    nome_arquivo = getattr(arquivo, 'name', 'arquivo enviado')
+    melhor_df = None
+    melhor_score = -1
+    erro_leitura = None
+
+    for header in range(6):
+        if hasattr(arquivo, 'seek'):
+            arquivo.seek(0)
+
+        try:
+            df_temp = pd.read_excel(arquivo, header=header)
+        except Exception as exc:
+            erro_leitura = exc
+            if header == 0:
+                break
+            continue
+
+        df_temp.columns = [normalizar_nome_coluna(coluna) for coluna in df_temp.columns]
+        score = sum(
+            coluna in df_temp.columns
+            for coluna in ['data', 'nrovenda', 'quantidade', 'categoria']
+        )
+        score += int(
+            any(coluna in df_temp.columns for coluna in ['valor', 'valor_base_calculo_comissao'])
+        )
+
+        if score > melhor_score:
+            melhor_df = df_temp
+            melhor_score = score
+
+        if score == 5:
+            return df_temp
+
+    if melhor_df is not None:
+        return melhor_df
+
+    raise ValueError(
+        f"Não foi possível ler o arquivo '{nome_arquivo}'. Verifique se ele está em .xlsx válido."
+    ) from erro_leitura
+
+
+def validar_colunas_necessarias(df, nome_arquivo):
+    colunas_obrigatorias = {'data', 'nrovenda', 'quantidade', 'categoria'}
+    colunas_faltantes = sorted(coluna for coluna in colunas_obrigatorias if coluna not in df.columns)
+    possui_coluna_valor = any(
+        coluna in df.columns for coluna in ['valor', 'valor_base_calculo_comissao']
+    )
+
+    if not colunas_faltantes and possui_coluna_valor:
+        return
+
+    detalhes = []
+    if colunas_faltantes:
+        detalhes.append(
+            "faltam as colunas "
+            + ", ".join(f"'{coluna}'" for coluna in colunas_faltantes)
+        )
+    if not possui_coluna_valor:
+        detalhes.append(
+            "não foi encontrada nenhuma coluna de faturamento ('valor' ou 'valor_base_calculo_comissao')"
+        )
+
+    raise ValueError(
+        f"O arquivo '{nome_arquivo}' não está no layout esperado do CRM: "
+        + "; ".join(detalhes)
+        + "."
+    )
+
+
 @st.cache_data
 def tratar_base_bruta(arquivos):
     lista_df = []
     for arquivo in arquivos:
-        df_temp = pd.read_excel(arquivo)
-        df_temp.columns = df_temp.columns.str.strip().str.lower()
+        df_temp = ler_planilha_bruta(arquivo)
+        validar_colunas_necessarias(df_temp, getattr(arquivo, 'name', 'arquivo enviado'))
         lista_df.append(df_temp)
-        
+
+    if not lista_df:
+        raise ValueError("Nenhuma planilha foi enviada para processamento.")
+
     df = pd.concat(lista_df, ignore_index=True)
-    
+
     colunas_moeda = ['valor', 'valor_base_calculo_comissao', 'desconto', 'acrescimo']
     for col in colunas_moeda:
         if col in df.columns:
@@ -65,19 +167,24 @@ def tratar_base_bruta(arquivos):
         df['quantidade'] = pd.to_numeric(df['quantidade'], errors='coerce').fillna(0).astype(int)
 
     if 'data' in df.columns:
-        df['data'] = pd.to_datetime(df['data'], errors='coerce')
+        df['data'] = pd.to_datetime(df['data'], errors='coerce', dayfirst=True)
         df = df.dropna(subset=['data'])
-        
+
+        if df.empty:
+            raise ValueError(
+                "As planilhas foram lidas, mas nenhuma linha tinha uma data válida na coluna 'data'."
+            )
+
         df['dia'] = df['data'].dt.day
         df['ano'] = df['data'].dt.year
         df['mes_num'] = df['data'].dt.month
-        
+
         meses_map = {1:'Janeiro', 2:'Fevereiro', 3:'Março', 4:'Abril', 5:'Maio', 6:'Junho', 7:'Julho', 8:'Agosto', 9:'Setembro', 10:'Outubro', 11:'Novembro', 12:'Dezembro'}
         df['mês'] = df['mes_num'].map(meses_map)
-        
+
         dias_semana = {0: 'Segunda-feira', 1: 'Terça-feira', 2: 'Quarta-feira', 3: 'Quinta-feira', 4: 'Sexta-feira', 5: 'Sábado', 6: 'Domingo'}
         df['dia semana'] = df['data'].dt.dayofweek.map(dias_semana)
-        
+
         cond_descendio = [(df['dia'] <= 10), (df['dia'] > 10) & (df['dia'] <= 20), (df['dia'] > 20)]
         df['descêndio'] = np.select(cond_descendio, ['1º Descêndio', '2º Descêndio', '3º Descêndio'])
 
@@ -93,8 +200,9 @@ def tratar_base_bruta(arquivos):
     else:
         df['valor_liquido_item'] = 0.0
 
-    if 'id_venda' in df.columns:
-        df = df.sort_values(by=['data', 'id_venda'])
+    colunas_ordenacao = [coluna for coluna in ['data', 'id_venda'] if coluna in df.columns]
+    if colunas_ordenacao:
+        df = df.sort_values(by=colunas_ordenacao)
         df['soma_total_da_venda'] = df.groupby('id_venda')['valor_liquido_item'].transform('sum')
         df['flag_venda_principal'] = np.where(df.duplicated(subset=['id_venda']), 0, 1)
         df['faturamento_venda_unica'] = np.where(df['flag_venda_principal'] == 1, df['soma_total_da_venda'], 0.0)
@@ -118,10 +226,16 @@ with aba1:
     
     if arquivos_brutos:
         with st.spinner("Processando..."):
-            df_consolidado = tratar_base_bruta(arquivos_brutos)
-            st.success("Base processada com sucesso!")
-            excel_data = converter_df_para_excel(df_consolidado)
-            st.download_button("📥 Baixar Base Consolidada", data=excel_data, file_name="Base_Consolidada_Morana.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            try:
+                df_consolidado = tratar_base_bruta(arquivos_brutos)
+            except ValueError as exc:
+                st.error(str(exc))
+            except Exception as exc:
+                st.error(f"Ocorreu um erro inesperado ao processar as planilhas: {exc}")
+            else:
+                st.success("Base processada com sucesso!")
+                excel_data = converter_df_para_excel(df_consolidado)
+                st.download_button("📥 Baixar Base Consolidada", data=excel_data, file_name="Base_Consolidada_Morana.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 with aba2:
     st.header("Gerador do Relatório Analítico")
