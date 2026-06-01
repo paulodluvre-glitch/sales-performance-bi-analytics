@@ -46,6 +46,20 @@ estilo_impressao = """
 st.markdown(estilo_impressao, unsafe_allow_html=True)
 
 MATPLOTLIB_DISPONIVEL = importlib.util.find_spec("matplotlib") is not None
+MESES_MAP = {
+    1: 'Janeiro', 2: 'Fevereiro', 3: 'Março', 4: 'Abril', 5: 'Maio', 6: 'Junho',
+    7: 'Julho', 8: 'Agosto', 9: 'Setembro', 10: 'Outubro', 11: 'Novembro', 12: 'Dezembro'
+}
+DIAS_SEMANA_MAP = {
+    0: 'Segunda-feira', 1: 'Terça-feira', 2: 'Quarta-feira', 3: 'Quinta-feira',
+    4: 'Sexta-feira', 5: 'Sábado', 6: 'Domingo'
+}
+ORDEM_DIAS = ['Segunda-feira', 'Terça-feira', 'Quarta-feira', 'Quinta-feira', 'Sexta-feira', 'Sábado', 'Domingo']
+COLUNAS_LEGADAS = {
+    'mes': 'mês',
+    'dia_semana': 'dia semana',
+    'descendio': 'descêndio'
+}
 
 ALIAS_COLUNAS = {
     'nro_venda': 'nrovenda',
@@ -187,6 +201,123 @@ def estilizar_mapa_calor(df_heat_display):
     return styler
 
 
+def enriquecer_colunas_calendario(df):
+    if 'data' not in df.columns:
+        return df
+
+    df = df.copy()
+    df['data'] = converter_coluna_data(df['data'])
+    df = df.dropna(subset=['data'])
+
+    if df.empty:
+        raise ValueError(
+            "A base consolidada não possui datas válidas na coluna 'data'."
+        )
+
+    df['dia'] = df['data'].dt.day
+    df['ano'] = df['data'].dt.year
+    df['mes_num'] = df['data'].dt.month
+    df['mês'] = df['mes_num'].map(MESES_MAP)
+    df['dia semana'] = df['data'].dt.dayofweek.map(DIAS_SEMANA_MAP)
+
+    cond_descendio = [
+        (df['dia'] <= 10),
+        (df['dia'] > 10) & (df['dia'] <= 20),
+        (df['dia'] > 20)
+    ]
+    df['descêndio'] = np.select(
+        cond_descendio,
+        ['1º Descêndio', '2º Descêndio', '3º Descêndio'],
+        default='Sem descêndio'
+    )
+    return df
+
+
+def preparar_base_consolidada(arquivo_consolidado):
+    df_base = pd.read_excel(arquivo_consolidado)
+    df_base.columns = [str(coluna).strip() for coluna in df_base.columns]
+
+    for coluna_legada, coluna_canonica in COLUNAS_LEGADAS.items():
+        if coluna_canonica not in df_base.columns and coluna_legada in df_base.columns:
+            df_base[coluna_canonica] = df_base[coluna_legada]
+
+    colunas_obrigatorias = {'data', 'quantidade', 'categoria'}
+    colunas_faltantes = sorted(coluna for coluna in colunas_obrigatorias if coluna not in df_base.columns)
+    if colunas_faltantes:
+        raise ValueError(
+            "A base consolidada está incompleta. Faltam as colunas "
+            + ", ".join(f"'{coluna}'" for coluna in colunas_faltantes)
+            + "."
+        )
+
+    colunas_numericas = [
+        'quantidade',
+        'valor',
+        'valor_base_calculo_comissao',
+        'valor_liquido_item',
+        'faturamento_venda_unica'
+    ]
+    for coluna in colunas_numericas:
+        if coluna in df_base.columns:
+            df_base[coluna] = pd.to_numeric(df_base[coluna], errors='coerce').fillna(0.0)
+
+    if 'quantidade' in df_base.columns:
+        df_base['quantidade'] = df_base['quantidade'].fillna(0).astype(int)
+
+    df_base = enriquecer_colunas_calendario(df_base)
+
+    if 'id_venda' not in df_base.columns:
+        if 'nrovenda' in df_base.columns:
+            df_base['id_venda'] = df_base['data'].dt.strftime('%Y-%m-%d') + '-' + df_base['nrovenda'].astype(str)
+        else:
+            df_base['id_venda'] = df_base.index.astype(str)
+
+    if 'valor_liquido_item' not in df_base.columns:
+        if 'valor_base_calculo_comissao' in df_base.columns:
+            df_base['valor_liquido_item'] = df_base['valor_base_calculo_comissao']
+        elif 'valor' in df_base.columns:
+            df_base['valor_liquido_item'] = df_base['valor']
+        else:
+            df_base['valor_liquido_item'] = 0.0
+
+    if 'faturamento_venda_unica' not in df_base.columns:
+        df_base = df_base.sort_values(by=['data', 'id_venda'])
+        df_base['soma_total_da_venda'] = df_base.groupby('id_venda')['valor_liquido_item'].transform('sum')
+        df_base['flag_venda_principal'] = np.where(df_base.duplicated(subset=['id_venda']), 0, 1)
+        df_base['faturamento_venda_unica'] = np.where(
+            df_base['flag_venda_principal'] == 1,
+            df_base['soma_total_da_venda'],
+            0.0
+        )
+
+    colunas_legadas_presentes = [
+        coluna for coluna in COLUNAS_LEGADAS if coluna in df_base.columns
+    ]
+    if colunas_legadas_presentes:
+        df_base = df_base.drop(columns=colunas_legadas_presentes)
+
+    return df_base
+
+
+def diagnosticar_base_consolidada(df_base):
+    resumo_datas = (
+        df_base.groupby(['ano', 'mes_num', 'mês'], as_index=False)
+        .agg(datas_unicas=('data', 'nunique'), linhas=('data', 'size'))
+        .sort_values(['ano', 'mes_num'])
+    )
+
+    alertas = []
+    for ano, grupo in resumo_datas.groupby('ano'):
+        meses_com_poucas_datas = grupo[grupo['datas_unicas'] <= 3]
+        if grupo['mes_num'].nunique() >= 6 and len(meses_com_poucas_datas) >= max(4, grupo['mes_num'].nunique() // 2):
+            meses_texto = ", ".join(meses_com_poucas_datas['mês'].tolist())
+            alertas.append(
+                f"{ano}: {len(meses_com_poucas_datas)} meses têm só 1 a 3 datas únicas ({meses_texto})."
+            )
+
+    return resumo_datas, alertas
+
+
 @st.cache_data
 def tratar_base_bruta(arquivos):
     lista_df = []
@@ -213,30 +344,7 @@ def tratar_base_bruta(arquivos):
         df['quantidade'] = pd.to_numeric(df['quantidade'], errors='coerce').fillna(0).astype(int)
 
     if 'data' in df.columns:
-        df['data'] = converter_coluna_data(df['data'])
-        df = df.dropna(subset=['data'])
-
-        if df.empty:
-            raise ValueError(
-                "As planilhas foram lidas, mas nenhuma linha tinha uma data válida na coluna 'data'."
-            )
-
-        df['dia'] = df['data'].dt.day
-        df['ano'] = df['data'].dt.year
-        df['mes_num'] = df['data'].dt.month
-
-        meses_map = {1:'Janeiro', 2:'Fevereiro', 3:'Março', 4:'Abril', 5:'Maio', 6:'Junho', 7:'Julho', 8:'Agosto', 9:'Setembro', 10:'Outubro', 11:'Novembro', 12:'Dezembro'}
-        df['mês'] = df['mes_num'].map(meses_map)
-
-        dias_semana = {0: 'Segunda-feira', 1: 'Terça-feira', 2: 'Quarta-feira', 3: 'Quinta-feira', 4: 'Sexta-feira', 5: 'Sábado', 6: 'Domingo'}
-        df['dia semana'] = df['data'].dt.dayofweek.map(dias_semana)
-
-        cond_descendio = [(df['dia'] <= 10), (df['dia'] > 10) & (df['dia'] <= 20), (df['dia'] > 20)]
-        df['descêndio'] = np.select(
-            cond_descendio,
-            ['1º Descêndio', '2º Descêndio', '3º Descêndio'],
-            default='Sem descêndio'
-        )
+        df = enriquecer_colunas_calendario(df)
 
     if 'data' in df.columns and 'nrovenda' in df.columns:
         df['id_venda'] = df['data'].dt.strftime('%Y-%m-%d') + '-' + df['nrovenda'].astype(str)
@@ -294,13 +402,47 @@ with aba2:
     arquivo_consolidado = st.file_uploader("Arraste a Base Consolidada (Excel)", type=['xlsx'], key="up_consolidado")
     
     if arquivo_consolidado:
-        df_base = pd.read_excel(arquivo_consolidado)
-        
+        try:
+            df_base = preparar_base_consolidada(arquivo_consolidado)
+        except ValueError as exc:
+            st.error(str(exc))
+            st.stop()
+        except Exception as exc:
+            st.error(f"Ocorreu um erro inesperado ao ler a Base Consolidada: {exc}")
+            st.stop()
+
+        resumo_datas, alertas_datas = diagnosticar_base_consolidada(df_base)
+        if alertas_datas:
+            st.error(
+                "Esta Base Consolidada parece ter sido gerada por uma versão antiga do programa com erro na interpretação das datas. "
+                "Por isso os meses e o mapa de calor ficam distorcidos. Gere novamente a base pela aba 1 com a versão atual."
+            )
+            for alerta in alertas_datas:
+                st.write(f"• {alerta}")
+            st.dataframe(
+                resumo_datas.rename(columns={
+                    'ano': 'Ano',
+                    'mes_num': 'Mês Num.',
+                    'mês': 'Mês',
+                    'datas_unicas': 'Datas Únicas',
+                    'linhas': 'Linhas'
+                }),
+                hide_index=True,
+                use_container_width=True
+            )
+            st.stop()
+
         st.sidebar.header("Filtros do Relatório")
         anos_disponiveis = sorted(df_base['ano'].dropna().unique(), reverse=True)
         ano_selecionado = st.sidebar.selectbox("Ano de Análise", anos_disponiveis)
-        
-        meses_disponiveis = df_base[df_base['ano'] == ano_selecionado]['mês'].dropna().unique()
+
+        meses_disponiveis = (
+            df_base[df_base['ano'] == ano_selecionado][['mes_num', 'mês']]
+            .dropna()
+            .drop_duplicates()
+            .sort_values('mes_num')['mês']
+            .tolist()
+        )
         mes_selecionado = st.sidebar.selectbox("Mês de Análise", meses_disponiveis)
         
         if st.sidebar.button("Gerar Dashboard"):
@@ -441,13 +583,11 @@ with aba2:
             st.subheader(f"3. MAPA DE CALOR ({mes_selecionado} {ano_selecionado})")
             st.write("Comportamento de vendas por dia da semana.")
 
-            ordem_dias = ['Segunda-feira', 'Terça-feira', 'Quarta-feira', 'Quinta-feira', 'Sexta-feira', 'Sábado', 'Domingo']
-            
             df_heat = df_atual.groupby('dia semana').agg(
                 Peças=('quantidade', 'sum'),
                 Vendas=('id_venda', 'nunique'),
                 Faturamento=('faturamento_venda_unica', 'sum')
-            ).reindex(ordem_dias).dropna().reset_index()
+            ).reindex(ORDEM_DIAS).dropna().reset_index()
             
             df_heat['P.A.'] = (df_heat['Peças'] / df_heat['Vendas']).fillna(0)
             df_heat['Ticket Médio'] = (df_heat['Faturamento'] / df_heat['Vendas']).fillna(0)
